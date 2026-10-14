@@ -11,6 +11,8 @@ const S = {
   focus: null,        // highlighted lost pair / trace
   cy: null,
   busy: 0,
+  examples: [], demo: null, flow: null, paths: null,
+  simSeq: 0, analysisSeq: 0,
 };
 
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -57,22 +59,55 @@ function baseReq() {
 async function loadExamples() {
   try {
     const data = await (await api("/api/examples")).json();
+    S.examples = data.examples;
     const sel = $("#examples");
     sel.innerHTML = `<option value="">Examples…</option>` +
-      data.examples.map((e, i) => `<option value="${i}">${esc(e.name)}</option>`).join("");
-    sel.onchange = () => {
-      const e = data.examples[sel.value];
-      if (e) { $("#yaml").value = e.yaml; analyze(); }
-    };
+      data.examples.map((e, i) => `<option value="${i}">${esc(e.title || e.name)}</option>`).join("");
+    sel.onchange = () => {if (sel.value !== "") chooseExample(Number(sel.value));};
+    $("#demoExamples").innerHTML = data.examples.map((e, i) =>
+      `<button class="demo-choice ghost" data-example="${i}" aria-pressed="false">${esc(e.title || e.name)}</button>`).join("");
+    $$("[data-example]").forEach((button) => button.onclick = () => chooseExample(Number(button.dataset.example)));
     const first = data.examples.find((e) => e.name === "campus") || data.examples[0];
-    if (first) { $("#yaml").value = first.yaml; sel.value = data.examples.indexOf(first); analyze(); }
+    if (first) chooseExample(data.examples.indexOf(first));
   } catch (e) { status(e.message, "err"); }
+}
+
+function chooseExample(index) {
+  const example = S.examples[index];
+  if (!example) return;
+  S.demo = example.demo || null;
+  S.flow = S.demo ? { src: S.demo.source, subnet: S.demo.subnet } : null;
+  S.failed.clear();
+  $("#examples").value = index;
+  $("#yaml").value = example.yaml;
+  $("#demoStory").textContent = S.demo?.description || "Select a source and destination, then fail a link to explore forwarding.";
+  $$("[data-example]").forEach((button) => button.setAttribute("aria-pressed", String(Number(button.dataset.example) === index)));
+  analyze();
+}
+
+function fillFlows() {
+  const routers = S.analysis.graph.nodes.map((n) => n.id);
+  const subnets = S.analysis.graph.nodes.flatMap((n) => n.subnets.map((s) => s.name)).sort();
+  if (!S.flow || !routers.includes(S.flow.src) || !subnets.includes(S.flow.subnet)) {
+    const destination = subnets[0];
+    const owner = S.analysis.graph.nodes.find((n) => n.subnets.some((s) => s.name === destination));
+    S.flow = {src: routers.find((r) => r !== owner?.id) || routers[0], subnet: destination};
+  }
+  $("#flowSource").innerHTML = routers.map((r) => `<option>${esc(r)}</option>`).join("");
+  $("#flowDestination").innerHTML = subnets.map((s) => `<option>${esc(s)}</option>`).join("");
+  $("#flowSource").value = S.flow.src;
+  $("#flowDestination").value = S.flow.subnet;
+  const known = new Set(S.analysis.graph.edges.map((e) => e.id));
+  $("#demoFailure").disabled = !S.demo?.failed?.length || !S.demo.failed.every((id) => known.has(id));
 }
 
 async function generate() {
   try {
     const seed = $("#genSeed").value, b = $("#genB").value;
     const data = await (await api(`/api/generate?seed=${encodeURIComponent(seed)}&buildings=${encodeURIComponent(b)}`)).json();
+    S.demo = null; S.flow = null; S.failed.clear();
+    $("#demoStory").textContent = "Generated network. Choose a flow and click links to explore failures.";
+    $$("[data-example]").forEach((button) => button.setAttribute("aria-pressed", "false"));
     $("#yaml").value = data.yaml;
     $("#examples").value = "";
     analyze();
@@ -82,21 +117,27 @@ async function generate() {
 /* ------------------------------------------------------------ analyze */
 async function analyze() {
   $("#analyze").disabled = true;
+  const sequence = ++S.analysisSeq;
+  ++S.simSeq;
+  S.paths.stop();
   try {
-    S.analysis = await (await api("/api/analyze", baseReq())).json();
+    const analysis = await (await api("/api/analyze", baseReq())).json();
+    if (sequence !== S.analysisSeq) return;
+    S.analysis = analysis;
     const known = new Set(S.analysis.graph.edges.map((e) => e.id));
     S.failed = new Set([...S.failed].filter((x) => known.has(x)));
     S.router = null; S.focus = null;
     $("#topoName").textContent = `${S.analysis.name} · ${S.analysis.graph.nodes.length} routers · ` +
       `${S.analysis.graph.edges.length} links · ${S.analysis.scenarios.length} scenarios · ${S.analysis.protocol.toUpperCase()}`;
     fillStrategies();
+    fillFlows();
     buildGraph();
     renderComparison(); renderAddr(); renderWhy(); renderScenarios(); renderExport();
     await runSim();
   } catch (e) {
     status(e.message, "err");
   } finally {
-    $("#analyze").disabled = false;
+    if (sequence === S.analysisSeq) $("#analyze").disabled = false;
   }
 }
 
@@ -130,7 +171,7 @@ function layoutPositions(graph) {
     (groups[key] = groups[key] || []).push(n);
   });
   const pos = {};
-  const DX = 120, DY = 120, GAP = 60;
+  const DX = 150, DY = 210, GAP = 85;
   let x = 0;
   const keys = Object.keys(groups).filter((k) => k !== "__bb")
     .sort((a, b) => parseInt(a) - parseInt(b) || a.localeCompare(b));
@@ -141,19 +182,98 @@ function layoutPositions(graph) {
     for (const [d, r] of Object.entries(rows)) {
       r.sort((a, b) => a.id.localeCompare(b.id));
       const off = (width - r.length) * DX / 2;
-      r.forEach((n, i) => (pos[n.id] = { x: x + off + i * DX, y: Number(d) * DY }));
+      r.forEach((n, i) => (pos[n.id] = { x: x + off + i * DX, y: Number(d) * DY + (r.length === 3 && n.role === "distribution" && i === 1 ? 95 : 0) }));
     }
     x += width * DX + GAP;
   }
   const total = Math.max(x - GAP, DX);
   const bb = (groups.__bb || []).sort((a, b) => a.id.localeCompare(b.id));
   const bbRows = {};
-  bb.forEach((n) => (bbRows[depth[n.id]] = bbRows[depth[n.id]] || []).push(n));
+  bb.forEach((n) => {const row = n.role === "core" ? 0 : 1; (bbRows[row] = bbRows[row] || []).push(n);});
   for (const [d, r] of Object.entries(bbRows)) {
     const span = (r.length - 1) * DX * 1.6;
-    r.forEach((n, i) => (pos[n.id] = { x: total / 2 - DX / 2 - span / 2 + i * DX * 1.6, y: Number(d) * DY - 30 }));
+    r.forEach((n, i) => (pos[n.id] = { x: total / 2 - DX / 2 - span / 2 + i * DX * 1.6, y: Number(d) * 110 - 60 }));
   }
   return pos;
+}
+
+function graphRenderingOptions() {
+  return {pixelRatio: Math.min(3, Math.max(2, window.devicePixelRatio || 1)),
+    textureOnViewport: false, motionBlur: false, hideEdgesOnViewport: false};
+}
+
+function fitGraph(cy) {
+  if (!cy || cy.destroyed()) return;
+  cy.resize();
+  cy.fit(cy.elements().not(".packet"), cy.width() < 500 ? 22 : 44);
+}
+
+function fitExpandedGraph(cy) {
+  fitGraph(cy);
+  if (cy.width() < 500) {
+    cy.zoom(Math.max(0.7, cy.zoom()));
+    const view = S.paths.views.find((v) => v.cy === cy);
+    if (view?.trace.path.length) cy.center(cy.getElementById(view.trace.path[0]));
+  }
+}
+
+function setPlaybackLabel(label) {
+  $$("#playPath, [data-playback='play']").forEach((button) => {button.textContent = label;});
+}
+
+function graphFor(id) {
+  return id === "cy" ? S.cy : S.paths?.mini[id.replace("cy-", "")];
+}
+
+let expandedGraph = null;
+function updateExpandedRoute() {
+  if (!expandedGraph) return;
+  const walk = {cy: "routeWalk", "cy-maxagg": "maxaggWalk", "cy-fasp": "faspWalk"}[expandedGraph.id];
+  const focused = document.activeElement.closest?.("#expandedRoute .hop");
+  const focusIndex = focused?.dataset.hop;
+  $("#expandedRoute").innerHTML = $("#" + walk).innerHTML;
+  $$("#expandedRoute .hop").forEach((hop) => {
+    hop.tabIndex = 0;
+    hop.setAttribute("role", "button");
+    hop.setAttribute("aria-label", "Center on " + hop.querySelector("b").textContent);
+    hop.title = "Center this router in the graph";
+  });
+  if (focusIndex !== undefined) $(`#expandedRoute [data-hop="${focusIndex}"]`)?.focus({preventScroll: true});
+}
+
+function expandGraph(id, opener) {
+  if (!graphFor(id)) return;
+  const cy = graphFor(id), canvas = $("#" + id), placeholder = document.createComment("graph position");
+  cy.unmount();
+  canvas.before(placeholder);
+  expandedGraph = {id, opener, placeholder, canvas};
+  $("#expandedGraphTitle").textContent = {cy: "Selected strategy", "cy-maxagg": "Maximum aggregation", "cy-fasp": "Proposed plan"}[id];
+  $("#expandedGraphSlot").append(canvas);
+  document.body.classList.add("graph-expanded");
+  updateExpandedRoute();
+  $("#graphDialog").showModal();
+  // Remount after moving the container: Cytoscape observes DOM removal and
+  // stops its renderer, so resizing alone leaves a frozen canvas behind.
+  cy.mount(canvas);
+  requestAnimationFrame(() => fitExpandedGraph(cy));
+}
+
+function changeGraphView(id, action, button) {
+  const cy = graphFor(id);
+  if (!cy) return;
+  if (action === "expand") {expandGraph(id, button); return;}
+  if (action === "fit") {fitGraph(cy); return;}
+  const factor = action === "in" ? 1.25 : 0.8;
+  cy.zoom({level: Math.max(cy.minZoom(), Math.min(cy.maxZoom(), cy.zoom() * factor)),
+    renderedPosition: {x: cy.width() / 2, y: cy.height() / 2}});
+}
+
+function watchGraphZoom(cy, id) {
+  const update = () => {
+    const output = $(`[data-graph-zoom="${id}"]`);
+    if (output) output.value = Math.round(cy.zoom() * 100) + "%";
+  };
+  cy.on("zoom", update); update();
 }
 
 function cyStyle() {
@@ -161,26 +281,28 @@ function cyStyle() {
     warn = css("--warn"), accent = css("--accent"), panel = css("--panel"), panel2 = css("--panel-2");
   return [
     { selector: "node", style: {
-      "background-color": "data(color)", label: "data(label)", color: ink, "font-size": 11,
-      "text-valign": "bottom", "text-margin-y": 4, "text-wrap": "wrap", width: 30, height: 30,
-      "border-width": 2, "border-color": panel, "text-background-color": panel2,
-      "text-background-opacity": 0.85, "text-background-padding": 2, "text-background-shape": "roundrectangle",
+      "background-color": "data(color)", label: "data(label)", color: ink, "font-size": 20,
+      "font-family": "Segoe UI, system-ui, sans-serif", "font-weight": 600, "min-zoomed-font-size": 0,
+      "text-valign": "bottom", "text-margin-y": 8, "text-wrap": "wrap", width: 46, height: 46,
+      "border-width": 3, "border-color": panel, "text-background-color": panel,
+      "text-background-opacity": 1, "text-background-padding": 4, "text-background-shape": "roundrectangle",
     } },
-    { selector: "node[role = 'core']", style: { shape: "round-rectangle", width: 38, height: 30 } },
-    { selector: "node[role = 'distribution']", style: { shape: "round-diamond", width: 34, height: 34 } },
+    { selector: "node[role = 'core']", style: { shape: "round-rectangle", width: 52, height: 42 } },
+    { selector: "node[role = 'distribution']", style: { shape: "round-diamond", width: 46, height: 46 } },
     { selector: ":parent", style: {
-      "background-color": "data(color)", "background-opacity": 0.07, "border-color": "data(color)",
-      "border-width": 1, "border-style": "dashed", label: "data(label)", "text-valign": "top",
-      "text-halign": "center", "font-size": 12, "font-weight": 600, color: muted, padding: 22,
-      shape: "round-rectangle", "text-background-opacity": 0,
+      "background-color": "data(color)", "background-opacity": 0.045, "border-color": "data(color)",
+      "border-width": 1.5, "border-style": "solid", label: "data(label)", "text-valign": "top",
+      "text-halign": "center", "font-size": 18, "font-weight": 600, color: ink, padding: 28,
+      shape: "round-rectangle", "text-background-opacity": 1, "text-background-color": panel, "text-margin-y": -8,
     } },
     { selector: "edge", style: {
-      width: 2.5, "line-color": "data(color)", label: "data(cost)", "font-size": 10, color: muted,
-      "text-background-color": panel, "text-background-opacity": 1, "text-background-padding": 1.5,
+      width: 2.5, "line-color": css("--graph-line"), label: "data(cost)", "font-size": 14, color: ink,
+      "font-weight": 600, "font-family": "Segoe UI, system-ui, sans-serif",
+      "text-background-color": panel, "text-background-opacity": 1, "text-background-padding": 4, "text-background-shape": "roundrectangle",
       "curve-style": "bezier", opacity: 0.9,
     } },
     { selector: "edge[area = 0]", style: { width: 3.5 } },
-    { selector: "edge.failed", style: { "line-color": bad, "line-style": "dashed", opacity: 0.85, color: bad, width: 3 } },
+    { selector: "edge.failed", style: { "line-color": bad, "line-style": "dashed", opacity: 1, color: bad, width: 4 } },
     { selector: "edge.onpath", style: { "line-color": accent, width: 6, opacity: 1, "z-index": 10 } },
     { selector: "edge.flatpath", style: { "line-color": css("--good"), width: 5, "line-style": "dotted", opacity: 1 } },
     { selector: "node.lostsrc", style: { "border-color": warn, "border-width": 4 } },
@@ -189,6 +311,14 @@ function cyStyle() {
     { selector: "node.onpath", style: { "border-color": accent, "border-width": 4 } },
     { selector: "edge:selected", style: { "overlay-opacity": 0.08 } },
     { selector: "node.dim, edge.dim", style: { opacity: 0.35 } },
+    { selector: "edge.route-forward", style: {"target-arrow-shape": "triangle", "target-arrow-color": accent, "arrow-scale": 1.3} },
+    { selector: "edge.route-reverse", style: {"source-arrow-shape": "triangle", "source-arrow-color": accent, "arrow-scale": 1.3} },
+    { selector: "node.route-source", style: {"border-color": accent, "border-width": 6} },
+    { selector: "node.route-destination", style: {"border-color": css("--good"), "border-width": 6} },
+    { selector: "node.route-stop", style: {"background-color": bad, "border-color": bad, "border-width": 6} },
+    { selector: "node.packet", style: {label: "", width: 15, height: 15, shape: "ellipse", "background-color": warn, "border-color": panel, "border-width": 2, "z-index": 100, events: "no"} },
+    { selector: "node.packet.delivered", style: {"background-color": css("--good")} },
+    { selector: "node.packet.dropped", style: {"background-color": bad} },
     { selector: "core", style: { "selection-box-color": line } },
   ];
 }
@@ -205,14 +335,14 @@ function buildGraph() {
       els.push({ group: "nodes", data: { id: pid, label: n.area === 0 ? "Backbone · area 0" : `${n.building} · area ${n.area}`, color: areaColor(n.area) } });
     }
     const lans = n.subnets.length ? `\n${n.subnets.length} LAN${n.subnets.length > 1 ? "s" : ""}` : "";
-    els.push({ group: "nodes", data: { id: n.id, parent: pid, label: n.id + lans, color: areaColor(n.area), role: n.role, area: n.area }, position: pos[n.id] });
+    els.push({ group: "nodes", data: { id: n.id, parent: pid, label: n.id + lans, baseLabel: n.id + lans, color: areaColor(n.area), role: n.role, area: n.area }, position: pos[n.id] });
   });
   g.edges.forEach((e) => {
     els.push({ group: "edges", data: { id: e.id, source: e.source, target: e.target, cost: e.cost, area: e.area, color: e.area === 0 ? css("--a0") : areaColor(e.area) } });
   });
   if (S.cy) S.cy.destroy();
   S.cy = cytoscape({
-    container: $("#cy"), elements: els, style: cyStyle(), layout: { name: "preset", padding: 30 },
+    ...graphRenderingOptions(), container: $("#cy"), elements: els, style: cyStyle(), layout: { name: "preset", padding: 30 },
     wheelSensitivity: 0.25, minZoom: 0.2, maxZoom: 3, autoungrabify: false,
   });
   S.cy.on("tap", "edge", (ev) => {
@@ -227,8 +357,9 @@ function buildGraph() {
     S.router = S.router === n.id() ? null : n.id();
     renderSide(); highlight();
   });
-  S.cy.on("tap", (ev) => { if (ev.target === S.cy) { S.router = null; S.focus = null; renderSide(); highlight(); } });
-  S.cy.fit(undefined, 30);
+  S.cy.on("tap", (ev) => { if (ev.target === S.cy) { S.router = null; renderSide(); highlight(); } });
+  fitGraph(S.cy);
+  watchGraphZoom(S.cy, "cy");
   renderLegend();
 }
 
@@ -238,6 +369,8 @@ function renderLegend() {
     .sort((a, b) => a[0] - b[0])
     .map(([a, b]) => `<span><i style="background:${areaColor(a)}"></i>${esc(b)} (area ${a})</span>`);
   items.push(`<span><i class="dash"></i>failed link</span>`);
+  items.push(`<span><i style="background:${css("--accent")}"></i>arrows show forwarding direction</span>`);
+  items.push(`<span><i style="background:${css("--warn")}"></i>packet position during replay</span>`);
   items.push(`<span><i style="background:${css("--bad")}"></i>drops traffic (discard route)</span>`);
   items.push(`<span><i style="background:transparent;border:3px solid ${css("--warn")}"></i>source losing traffic</span>`);
   $("#legend").innerHTML = items.join("");
@@ -279,15 +412,22 @@ function highlight() {
 /* ------------------------------------------------------------ simulate */
 async function runSim(trace) {
   if (!S.analysis) return;
+  const sequence = ++S.simSeq;
+  S.paths.stop();
+  if (trace) S.flow = {src: trace.src, subnet: trace.subnet};
   try {
-    const body = { ...baseReq(), strategy: S.strategy, failed: [...S.failed] };
-    if (trace) Object.assign(body, trace);
-    S.sim = await (await api("/api/simulate", body)).json();
-    if (trace && S.sim.selected.trace) {
+    const body = { ...baseReq(), strategy: S.strategy, failed: [...S.failed], ...S.flow };
+    const simulation = await (await api("/api/simulate", body)).json();
+    if (sequence !== S.simSeq) return;
+    S.sim = simulation;
+    if (S.sim.selected.trace) {
       const t = S.sim.selected.trace;
       S.focus = { path: t.path, flatPath: t.flat.path, trace: t };
     }
+    $("#flowSource").value = S.flow.src;
+    $("#flowDestination").value = S.flow.subnet;
     renderContrast(); renderSide(); highlight();
+    S.paths.update();
   } catch (e) { status(e.message, "err"); }
 }
 
@@ -349,8 +489,8 @@ function renderSide() {
   $$(".lost li", side).forEach((li) => (li.onclick = () => {
     const i = Number(li.dataset.i);
     const p = sel.lost_pairs[i];
-    S.focus = S.focus && S.focus.i === i ? null : { i, path: p.path };
-    renderSide(); highlight();
+    S.router = null;
+    runSim({src: p.src, subnet: p.subnet});
   }));
 }
 
@@ -494,6 +634,7 @@ function saveBlob(blob, name) {
 }
 
 function setStrategy(s) {
+  S.router = null;
   S.strategy = s;
   $("#strategy").value = s;
   S.focus = null;
@@ -503,6 +644,16 @@ function setStrategy(s) {
 
 /* ------------------------------------------------------------ wiring */
 function init() {
+  S.paths = new FasplanPaths();
+  const traceSelectedFlow = () => {S.router = null; runSim({src: $("#flowSource").value, subnet: $("#flowDestination").value});};
+  $("#traceFlow").onclick = traceSelectedFlow;
+  $("#flowSource").onchange = traceSelectedFlow;
+  $("#flowDestination").onchange = traceSelectedFlow;
+  $("#demoFailure").onclick = () => {S.failed = new Set(S.demo.failed); S.router = null; runSim();};
+  $("#playPath").onclick = () => S.paths.play();
+  $("#stepPath").onclick = () => S.paths.next();
+  $("[data-playback='play']").onclick = () => S.paths.play();
+  $("[data-playback='next']").onclick = () => S.paths.next();
   $$(".seg button").forEach((b) => (b.onclick = () => {
     if (S.protocol === b.dataset.proto) return;
     S.protocol = b.dataset.proto;
@@ -512,8 +663,33 @@ function init() {
   $("#strategy").onchange = (e) => setStrategy(e.target.value);
   $("#analyze").onclick = analyze;
   $("#genBtn").onclick = generate;
-  $("#clearFail").onclick = () => { S.failed.clear(); S.focus = null; runSim(); };
-  $("#fit").onclick = () => S.cy && S.cy.fit(undefined, 30);
+  $("#clearFail").onclick = () => { S.failed.clear(); S.router = null; S.focus = null; runSim(); };
+  $$('[data-graph-action]').forEach((button) => button.onclick = () => changeGraphView(button.dataset.graph, button.dataset.graphAction, button));
+  $$('[data-expanded-action]').forEach((button) => button.onclick = () => expandedGraph && changeGraphView(expandedGraph.id, button.dataset.expandedAction, button));
+  $("#closeGraphDialog").onclick = () => $("#graphDialog").close();
+  $("#graphDialog").addEventListener("close", () => {
+    if (!expandedGraph) return;
+    const {id, canvas, placeholder, opener} = expandedGraph;
+    const cy = graphFor(id);
+    cy?.unmount();
+    placeholder.replaceWith(canvas);
+    cy?.mount(canvas);
+    expandedGraph = null;
+    document.body.classList.remove("graph-expanded");
+    requestAnimationFrame(() => fitGraph(graphFor(id)));
+    opener?.focus();
+  });
+  const centerExpandedHop = (event) => {
+    if (!expandedGraph || (event.type === "keydown" && !["Enter", " "].includes(event.key))) return;
+    const hop = event.target.closest(".hop");
+    if (!hop) return;
+    event.preventDefault();
+    const cy = graphFor(expandedGraph.id), view = S.paths.views.find((v) => v.cy === cy);
+    const router = view?.trace.path[Number(hop.dataset.hop)];
+    if (router) {cy.zoom(Math.max(0.75, cy.zoom())); cy.center(cy.getElementById(router));}
+  };
+  $("#expandedRoute").onclick = centerExpandedHop;
+  $("#expandedRoute").onkeydown = centerExpandedHop;
   const sync = () => { $("#tnOut").textContent = Number($("#tauN").value).toFixed(2); $("#tfOut").textContent = Number($("#tauF").value).toFixed(2); };
   $("#tauN").oninput = sync; $("#tauF").oninput = sync;
   $("#tauN").onchange = analyze; $("#tauF").onchange = analyze;
@@ -531,7 +707,7 @@ function init() {
     $$(".tab").forEach((t) => t.classList.toggle("on", t.id === "tab-" + b.dataset.tab));
   }));
   window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
-    if (S.analysis) { buildGraph(); highlight(); renderScenarios(); }
+    if (S.analysis) { buildGraph(); highlight(); S.paths.update(); renderScenarios(); }
   });
   if (typeof cytoscape === "undefined") status("Cytoscape failed to load (offline?)", "err");
   loadExamples();
